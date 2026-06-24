@@ -1,0 +1,197 @@
+name: Build AP8220 Lean LEDE OpenClash Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt update
+          sudo apt install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex g++ g++-multilib gawk gcc gcc-multilib gettext git gperf \
+            haveged help2man intltool libelf-dev libglib2.0-dev libncurses5-dev \
+            libssl-dev libtool libyaml-dev mkisofs msmtp ninja-build p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils qemu-utils \
+            re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+
+      - name: Clone Lean LEDE source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --single-branch --filter=blob:none https://github.com/coolsnowwolf/lede.git openwrt
+          cd openwrt
+          git log -1 --oneline
+
+      - name: Add OpenClash LuCI package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd openwrt
+          rm -rf /tmp/OpenClash package/lean/luci-app-openclash
+          git clone --depth=1 --single-branch --branch master https://github.com/vernesong/OpenClash.git /tmp/OpenClash
+          mkdir -p package/lean
+          cp -a /tmp/OpenClash/luci-app-openclash package/lean/luci-app-openclash
+          test -f package/lean/luci-app-openclash/Makefile
+
+      - name: Verify AP8220 support
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd openwrt
+          grep -R "define Device/aliyun_ap8220" target/linux/qualcommax/image -n
+          grep -R "aliyun,ap8220" target/linux/qualcommax -n
+          grep -R "ipq-wifi-aliyun_ap8220" package target/linux -n || true
+
+      - name: Update feeds
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate optimized config
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd openwrt
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-app-vlmcsd=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-cpufreq=y
+          CONFIG_PACKAGE_tailscale=y
+
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_vlmcsd=y
+
+          CONFIG_PACKAGE_ipq-wifi-aliyun_ap8220=y
+
+          # Keep one SSL backend only. Do not enable luci-ssl here.
+          CONFIG_PACKAGE_libustream-openssl=y
+          # CONFIG_PACKAGE_libustream-mbedtls is not set
+          # CONFIG_PACKAGE_libustream-wolfssl is not set
+          # CONFIG_PACKAGE_luci-ssl is not set
+          # CONFIG_PACKAGE_wget-ssl is not set
+
+          CONFIG_CCACHE=y
+          EOF
+
+          sed -i 's/^[[:space:]]*//' .config
+          make defconfig
+
+          echo "=== Requested package selection ==="
+          grep -E "CONFIG_TARGET_qualcommax|CONFIG_TARGET_qualcommax_ipq807x|CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220" .config
+          grep -E "CONFIG_PACKAGE_luci-app-openclash|CONFIG_PACKAGE_luci-app-vlmcsd|CONFIG_PACKAGE_luci-app-upnp|CONFIG_PACKAGE_luci-app-cpufreq|CONFIG_PACKAGE_tailscale|CONFIG_PACKAGE_kmod-tun|CONFIG_PACKAGE_libustream" .config || true
+
+          required_symbols="
+          CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220
+          CONFIG_PACKAGE_luci-app-openclash
+          CONFIG_PACKAGE_luci-app-vlmcsd
+          CONFIG_PACKAGE_luci-app-upnp
+          CONFIG_PACKAGE_luci-app-cpufreq
+          CONFIG_PACKAGE_tailscale
+          CONFIG_PACKAGE_kmod-tun
+          "
+
+          for sym in $required_symbols; do
+            if ! grep -q "^${sym}=y" .config; then
+              echo "ERROR: ${sym} is not selected after make defconfig."
+              echo "This package may be missing from current Lean feeds, or it was not installable for this target."
+              exit 1
+            fi
+          done
+
+          if grep -q '^CONFIG_PACKAGE_libustream-mbedtls=y' .config && grep -q '^CONFIG_PACKAGE_libustream-openssl=y' .config; then
+            echo "ERROR: libustream mbedTLS and OpenSSL are both selected. This will clash at package/install."
+            exit 1
+          fi
+
+      - name: Download sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set +e
+          cd openwrt
+
+          echo "=== Parallel build start ==="
+          make -j"$(nproc)" V=s 2>&1 | tee ../build-parallel.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "=== Parallel build failed. Retry with single job for clear error ==="
+            make -j1 V=s 2>&1 | tee ../build-single.log
+            BUILD_STATUS=${PIPESTATUS[0]}
+          fi
+
+          echo "=== List output files ==="
+          find bin/targets/qualcommax/ipq807x -maxdepth 3 -type f | sort || true
+
+          echo "=== Check AP8220 firmware images ==="
+          find bin/targets/qualcommax/ipq807x -type f \( -name "*ap8220*.bin" -o -name "*ap8220*.ubi" -o -name "*ap8220*.itb" \) -print || true
+
+          exit "$BUILD_STATUS"
+
+      - name: Collect firmware and logs
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact
+          cp -rv openwrt/bin/targets/qualcommax/ipq807x artifact/targets || true
+          cp openwrt/.config artifact/config.buildinfo || true
+          cp build-parallel.log artifact/ 2>/dev/null || true
+          cp build-single.log artifact/ 2>/dev/null || true
+          echo "=== Artifact file list ==="
+          find artifact -type f | sort
+
+      - name: Upload firmware artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ap8220-openclash-tailscale-lean
+          path: artifact
+          retention-days: 7
