@@ -2,88 +2,266 @@ name: Build AP8220 128M ImmortalWrt
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "OpenWrt source repository"
+        required: true
+        default: "https://github.com/immortalwrt/immortalwrt.git"
+      source_branch:
+        description: "Source branch"
+        required: true
+        default: "master"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
 
     steps:
-      - name: Checkout build repo
-        uses: actions/checkout@v4
+      - name: Checkout build repository
+        uses: actions/checkout@v5
 
       - name: Free disk space
         run: |
+          set -euxo pipefail
           df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune -af || true
           df -h
 
       - name: Install build dependencies
         run: |
+          set -euxo pipefail
           sudo apt update
           sudo apt install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses5-dev libssl-dev python3 python3-pip \
-            python3-setuptools rsync swig unzip zlib1g-dev file wget ccache \
-            device-tree-compiler libelf-dev
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex g++ g++-multilib gawk gcc gcc-multilib gettext git gperf \
+            haveged help2man intltool libelf-dev libglib2.0-dev libncurses5-dev \
+            libssl-dev libtool libyaml-dev mkisofs msmtp ninja-build p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils qemu-utils \
+            re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev
 
-      - name: Clone ImmortalWrt
+      - name: Clone source
         run: |
-          git clone --depth=1 --branch master https://github.com/immortalwrt/immortalwrt.git openwrt
+          set -euxo pipefail
+          git clone --depth=1 --single-branch --filter=blob:none \
+            -b "${{ inputs.source_branch }}" \
+            "${{ inputs.source_repo }}" \
+            openwrt
+          cd openwrt
+          git log -1 --oneline
+          ls target/linux
 
       - name: Check AP8220 support
         run: |
+          set -euxo pipefail
           cd openwrt
-          grep -R "Device/aliyun_ap8220" target/linux || true
-          grep -R "aliyun_ap8220" package/firmware target/linux || true
+          echo "Searching AP8220 files..."
+          find target/linux package -iname "*ap8220*" -print || true
+          grep -R "aliyun_ap8220\|aliyun,ap8220\|AP8220" target/linux package -n || true
 
-      - name: Apply AP8220 128M rootfs patch
+      - name: Patch AP8220 to 128M single rootfs layout
         run: |
+          set -euxo pipefail
           cd openwrt
-          for p in ../patches/*.patch; do
-            echo "Applying $p"
-            git apply --whitespace=fix "$p"
-          done
 
-      - name: Update feeds
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(".")
+
+          dts_candidates = []
+          for p in root.glob("target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/*.dts"):
+              text = p.read_text(errors="ignore")
+              if "aliyun,ap8220" in text or "Aliyun AP8220" in text:
+                  dts_candidates.append(p)
+
+          if not dts_candidates:
+              print("ERROR: Cannot find AP8220 DTS file.")
+              print("ImmortalWrt source may not include AP8220 support yet.")
+              sys.exit(1)
+
+          dts = dts_candidates[0]
+          print(f"Using DTS: {dts}")
+
+          s = dts.read_text()
+
+          old_re = re.compile(
+              r'''
+              (?P<prefix>
+                  partitions\s*\{\s*
+                  compatible\s*=\s*"fixed-partitions";\s*
+                  \#address-cells\s*=\s*<1>;\s*
+                  \#size-cells\s*=\s*<1>;\s*
+              )
+              (?P<body>
+                  partition@0\s*\{\s*
+                      label\s*=\s*"rootfs1";\s*
+                      reg\s*=\s*<0x0000000\s+0x3000000>;\s*
+                  \};\s*
+                  partition@3000000\s*\{\s*
+                      label\s*=\s*"rootfs2";\s*
+                      reg\s*=\s*<0x3000000\s+0x3000000>;\s*
+                  \};\s*
+                  partition@6000000\s*\{\s*
+                      label\s*=\s*"usrdata";\s*
+                      reg\s*=\s*<0x6000000\s+0x2000000>;\s*
+                  \};\s*
+              )
+              (?P<suffix>\};)
+              ''',
+              re.M | re.S | re.X
+          )
+
+          new_block = '''\\g<prefix>
+                          partition@0 {
+                                  label = "rootfs";
+                                  reg = <0x0000000 0x8000000>;
+                          };
+                  \\g<suffix>'''
+
+          s2, n = old_re.subn(new_block, s, count=1)
+
+          if n != 1:
+              print("ERROR: Failed to replace NAND rootfs1/rootfs2/usrdata partition block.")
+              print("Relevant lines:")
+              for i, line in enumerate(s.splitlines(), 1):
+                  if "rootfs1" in line or "rootfs2" in line or "usrdata" in line:
+                      print(f"{i}: {line}")
+              sys.exit(1)
+
+          dts.write_text(s2)
+          print("DTS partition layout patched to single 128M rootfs.")
+
+          platform = Path("target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh")
+          if not platform.exists():
+              print(f"ERROR: Cannot find {platform}")
+              sys.exit(1)
+
+          ps = platform.read_text()
+
+          old_platform_re = re.compile(
+              r'''
+              (?P<head>\n\s*aliyun,ap8220\)\s*\n)
+              \s*active="\$\(fw_printenv -n active\)"\s*\n
+              \s*if\s+\[\s*"\$active"\s+-eq\s+"1"\s*\];\s*then\s*\n
+              \s*CI_UBIPART="rootfs1"\s*\n
+              \s*else\s*\n
+              \s*CI_UBIPART="rootfs2"\s*\n
+              \s*fi\s*\n
+              \s*nand_do_upgrade\s+"\$1"\s*\n
+              \s*;; 
+              ''',
+              re.M | re.S | re.X
+          )
+
+          new_platform = '''\\g<head>\t\tCI_UBIPART="rootfs"
+                          nand_do_upgrade "$1"
+                          ;;'''
+
+          ps2, n2 = old_platform_re.subn(new_platform, ps, count=1)
+
+          if n2 != 1:
+              print("ERROR: Failed to patch platform.sh AP8220 upgrade target.")
+              print("Relevant lines:")
+              for i, line in enumerate(ps.splitlines(), 1):
+                  if "aliyun,ap8220" in line or "rootfs1" in line or "rootfs2" in line or "CI_UBIPART" in line:
+                      print(f"{i}: {line}")
+              sys.exit(1)
+
+          platform.write_text(ps2)
+          print("platform.sh patched: CI_UBIPART=rootfs.")
+
+          print("Patch result summary:")
+          print("---- DTS rootfs lines ----")
+          for i, line in enumerate(dts.read_text().splitlines(), 1):
+              if "rootfs" in line or "partition@0" in line or "0x8000000" in line:
+                  print(f"{i}: {line}")
+
+          print("---- platform.sh AP8220 lines ----")
+          lines = platform.read_text().splitlines()
+          for i, line in enumerate(lines, 1):
+              if "aliyun,ap8220" in line:
+                  for j in range(max(1, i), min(len(lines), i + 6) + 1):
+                      print(f"{j}: {lines[j-1]}")
+          PY
+
+      - name: Update and install feeds
         run: |
+          set -euxo pipefail
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Load config
+      - name: Generate build config
         run: |
-          cp configs/ap8220-128m.config openwrt/.config
+          set -euxo pipefail
           cd openwrt
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_wget-ssl=y
+
+          CONFIG_CCACHE=y
+          EOF
+
+          sed -i 's/^[[:space:]]*//' .config
           make defconfig
+
+          echo "Checking selected target..."
           grep -E "CONFIG_TARGET_qualcommax|CONFIG_TARGET_qualcommax_ipq807x|CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220" .config
 
-      - name: Download packages
+          if ! grep -q '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_aliyun_ap8220=y' .config; then
+            echo "ERROR: AP8220 target is not available in this source tree."
+            echo "Try switching source_repo to https://github.com/openwrt/openwrt.git and source_branch to main."
+            exit 1
+          fi
+
+      - name: Download sources
         run: |
+          set -euxo pipefail
           cd openwrt
           make download -j8 || make download -j1 V=s
 
       - name: Build firmware
         run: |
+          set -euxo pipefail
           cd openwrt
-          make -j$(nproc) V=s
+          make -j"$(nproc)" V=s
 
       - name: Collect firmware
         if: always()
         run: |
+          set -euxo pipefail
           mkdir -p artifact
           cp -rv openwrt/bin/targets/qualcommax/ipq807x artifact/targets || true
           cp openwrt/.config artifact/config.buildinfo || true
           find artifact -type f | sort
 
       - name: Upload firmware artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ap8220-128m-immortalwrt
+          name: ap8220-128m-firmware
           path: artifact
           retention-days: 7
