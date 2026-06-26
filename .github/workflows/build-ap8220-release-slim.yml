@@ -1,4 +1,4 @@
-name: Auto Build AP8220 Lean LEDE Release Slim V6
+name: Auto Build AP8220 Lean LEDE Lite Release Slim
 
 on:
   workflow_dispatch:
@@ -391,7 +391,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ap8220-lean-wifi-v6-${{ env.SOURCE_SHORT }}
+          name: ap8220-lean-lite-${{ env.SOURCE_SHORT }}
           path: release-assets/*
           retention-days: 7
           compression-level: 0
@@ -401,10 +401,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TZ: Asia/Shanghai
         run: |
           set -euxo pipefail
-          TAG="ap8220-lean-wifi-v6-${SOURCE_SHORT}-${GITHUB_RUN_NUMBER}"
-          TITLE="AP8220 Lean LEDE WiFi V6 ${SOURCE_SHORT}"
+          BUILD_DATE="$(date +'%Y-%m-%d')"
+          TAG="ap8220-lean-lite-${BUILD_DATE}-${SOURCE_SHORT}-${GITHUB_RUN_NUMBER}"
+          TITLE="AP8220 Lean LEDE Lite ${BUILD_DATE} ${SOURCE_SHORT}"
 
           gh release create "$TAG" release-assets/* \
             --title "$TITLE" \
