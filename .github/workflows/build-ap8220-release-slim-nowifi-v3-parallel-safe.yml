@@ -1,4 +1,4 @@
-name: Auto Build AP8220 Lean LEDE Release Slim NoWiFi V3 Parallel Safe
+name: Auto Build AP8220 Lean LEDE Release Slim No WiFi
 
 on:
   workflow_dispatch:
